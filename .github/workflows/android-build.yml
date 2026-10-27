@@ -1,0 +1,206 @@
+name: GoldenEye007-N64 APK Build
+
+# Builds the dedicated GoldenEye 007 (N64) Android APK.
+# Expected repository layout:
+#   GoldenEye007-N64-Project.zip        <- the project ZIP, uploaded to the repo root
+#   .github/workflows/android-build.yml <- this file
+# Upstream engine source is cloned from GitHub at a pinned, SHA-verified commit.
+
+on:
+  workflow_dispatch:
+  push:
+
+concurrency:
+  group: ge007-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ZIP: GoldenEye007-N64-Project.zip
+  UPSTREAM_REPO: https://github.com/mupen64plus-ae/mupen64plus-ae.git
+  UPSTREAM_SHA: 33bf7021549d7873e976884370fbd1a8e7333bc7
+  APK_BASENAME: GoldenEye007-N64-release.apk
+
+jobs:
+  build:
+    name: Build GoldenEye 007 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify project ZIP exists at repository root
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PROJECT_ZIP" ]; then
+            echo "::error::Expected '$PROJECT_ZIP' at the repository root."
+            echo "::error::Upload it via GitHub web UI: Add file -> Upload files."
+            exit 1
+          fi
+          echo "Found project archive:"
+          ls -la "$PROJECT_ZIP"
+
+      - name: Verify ZIP integrity and extract project
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends unzip
+          if ! unzip -t "$PROJECT_ZIP" > /dev/null; then
+            echo "::error::$PROJECT_ZIP is corrupt or not a valid ZIP archive."
+            exit 1
+          fi
+          echo "ZIP integrity: OK"
+          mkdir -p project
+          unzip -q -o "$PROJECT_ZIP" -d project
+          if [ -d "project/GoldenEye007-N64" ]; then
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE/project/GoldenEye007-N64" >> "$GITHUB_ENV"
+          else
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE/project" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify mandatory project files
+        run: |
+          set -euo pipefail
+          for REQUIRED in \
+            "$PROJECT_DIR/overlay/apply-overlay.sh" \
+            "$PROJECT_DIR/overlay/gradle/goldeneye-branding.gradle" \
+            "$PROJECT_DIR/overlay/icons/ic_launcher_master.png" \
+            "$PROJECT_DIR/pins/mupen64plus-ae.sha"
+          do
+            if [ ! -f "$REQUIRED" ]; then
+              echo "::error::Missing mandatory project file: $REQUIRED"
+              exit 1
+            fi
+          done
+          echo "All mandatory project files present."
+
+      - name: Verify pinned engine SHA is consistent
+        run: |
+          set -euo pipefail
+          PINNED="$(tr -d '[:space:]' < "$PROJECT_DIR/pins/mupen64plus-ae.sha")"
+          if [ "$PINNED" != "$UPSTREAM_SHA" ]; then
+            echo "::error::pins/mupen64plus-ae.sha ($PINNED) does not match workflow UPSTREAM_SHA ($UPSTREAM_SHA)."
+            exit 1
+          fi
+          echo "Engine pinned at commit $PINNED"
+
+      - name: Set up Android SDK (cmdline-tools, licenses accepted)
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 9477386
+
+      - name: Set up JDK 21 (required by AGP 9.x / Gradle 9.5)
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: adopt
+
+      - name: Export Android environment variables
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "SDK root : $ANDROID_HOME"
+          echo "NDK root : $ANDROID_NDK_HOME"
+
+      - name: Install native build dependencies (file, gawk)
+        run: |
+          sudo apt-get install -y --no-install-recommends file gawk
+          command -v gawk
+          command -v file
+
+      - name: Clone engine source at pinned commit
+        run: |
+          set -euo pipefail
+          git clone "$UPSTREAM_REPO" engine
+          git -C engine checkout "$UPSTREAM_SHA"
+          ACTUAL="$(git -C engine rev-parse HEAD)"
+          echo "Engine checkout: $ACTUAL"
+          if [ "$ACTUAL" != "$UPSTREAM_SHA" ]; then
+            echo "::error::Engine source verification failed: HEAD is $ACTUAL, expected $UPSTREAM_SHA"
+            exit 1
+          fi
+
+      - name: Verify engine source tree before building
+        run: |
+          set -euo pipefail
+          test -x engine/gradlew
+          test -f engine/app/build.gradle
+          test -f engine/app/src/main/AndroidManifest.xml
+          test -f engine/app/src/main/res/values/strings.xml
+          test -f engine/gradle/wrapper/gradle-wrapper.properties
+          echo "Engine tree verified. Gradle wrapper pinned to:"
+          grep distributionUrl engine/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Apply GoldenEye 007 branding overlay
+        run: |
+          bash "$PROJECT_DIR/overlay/apply-overlay.sh" "$GITHUB_WORKSPACE/engine" "$PROJECT_DIR/overlay"
+
+      - name: Provision pinned Gradle distribution (wrapper, Gradle 9.5.0)
+        working-directory: engine
+        run: ./gradlew --version
+
+      - name: Build debug + release APKs (release is debug-signed, installable)
+        working-directory: engine
+        run: ./gradlew assemble --stacktrace
+
+      - name: Verify APK output and native libraries
+        run: |
+          set -euo pipefail
+          APK_PATH="engine/app/build/outputs/apk/release/$APK_BASENAME"
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK not found or empty at expected path: $APK_PATH"
+            echo "APKs actually produced:"
+            find engine/app/build/outputs -name '*.apk' -print || true
+            exit 1
+          fi
+          echo "=============================================="
+          echo "EXPECTED APK OUTPUT LOCATION:"
+          echo "  $GITHUB_WORKSPACE/$APK_PATH"
+          echo "=============================================="
+          ls -la "$APK_PATH"
+          echo "--- arm64-v8a native libraries inside APK ---"
+          if ! unzip -l "$APK_PATH" | grep 'lib/arm64-v8a/.*\.so'; then
+            echo "::error::No arm64-v8a native libraries found in APK."
+            exit 1
+          fi
+          echo "Native library count (arm64-v8a):"
+          unzip -l "$APK_PATH" | grep -c 'lib/arm64-v8a/.*\.so'
+          echo "--- package metadata ---"
+          AAPT_BIN="$(find "$ANDROID_HOME/build-tools" -name 'aapt' -o -name 'aapt2' 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$AAPT_BIN" ]; then
+            "$AAPT_BIN" dump badging "$APK_PATH" | head -n 4 || true
+          else
+            echo "aapt not found; skipping badging dump (APK already verified above)."
+          fi
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/GoldenEye007-N64.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoldenEye007-N64-apk
+          path: GoldenEye007-N64.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Collect build logs on failure
+        if: failure()
+        run: |
+          mkdir -p build-logs
+          echo "Build failed. Captured diagnostics:" > build-logs/README.txt
+          find engine/app/build/outputs/logs -type f -name '*.log' -exec cp {} build-logs/ \; 2>/dev/null || true
+          find engine -maxdepth 2 -name 'hs_err_pid*.log' -exec cp {} build-logs/ \; 2>/dev/null || true
+          (cd engine && ./gradlew --version > ../build-logs/gradle-version.txt 2>&1) || true
+          env | grep -E '^(ANDROID|JAVA|GITHUB_ACTION)' | sort > build-logs/environment.txt || true
+          ls -la build-logs
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoldenEye007-N64-build-logs
+          path: build-logs
+          if-no-files-found: warn
+          retention-days: 14
+defaults:
+  
